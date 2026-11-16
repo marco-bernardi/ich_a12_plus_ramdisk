@@ -1,0 +1,320 @@
+name: Build iPad Air 3 Cellular A12 Ramdisk
+
+on:
+  workflow_dispatch:
+    inputs:
+      ios_version:
+        description: 'iPadOS 17.4.1 build (fixed diagnostic target)'
+        required: true
+        default: '21E237'
+        type: choice
+        options:
+          - '21E237'
+      kernel:
+        description: 'Kernel patch mode'
+        required: true
+        default: 'stock'
+        type: choice
+        options:
+          - patched
+          - stock
+      with_fw:
+        description: 'Include coprocessor firmware (AOP/ANE/AVE/ISP/GFX/SIO/PMP)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET_BUILD: ${{ inputs.ios_version }}
+      KERNEL_MODE: ${{ inputs.kernel }}
+      WITH_FW: ${{ inputs.with_fw }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          echo "=== macOS Version ==="
+          sw_vers
+          echo "=== Architecture ==="
+          uname -m
+          echo "=== PATH ==="
+          tr ':' '\n' <<< "$PATH"
+
+      - name: Install system dependencies
+        run: |
+          set -e
+          brew update
+          brew install ipsw curl python@3 bash
+          which ipsw || { echo "FAIL: ipsw not installed" >&2; exit 1; }
+          which python3 || { echo "FAIL: python3 not installed" >&2; exit 1; }
+          echo "OK: ipsw $(ipsw version 2>/dev/null | head -1)"
+
+      - name: Setup Python venv
+        run: |
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "WARNING: requirements.txt missing, installing known deps"
+            python -m pip install pyimg4 capstone pillow
+          fi
+          python -c "import pyimg4, capstone; print('OK: pyimg4 + capstone')"
+          echo "VENV_PYTHON=$(pwd)/.venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Verify repository structure
+        run: |
+          set -e
+          for f in build.sh env.sh scripts/devices.sh scripts/ramdisk_expand.sh patch/iboot_patchfinder.py patch/apply_kernel_patches.py patch/finalize_iboot.py patch/preflight.py; do
+            [[ -f "$f" ]] || { echo "MISS: $f" >&2; exit 1; }
+            echo "OK: $f"
+          done
+          for r in resources/IM4M_0x8020 resources/ssh.tar.gz resources/sshtarlist.txt; do
+            [[ -f "$r" ]] || { echo "MISS: $r" >&2; exit 1; }
+            echo "OK: $r"
+          done
+          chmod +x build.sh scripts/make_logo.sh tools/darwin/*
+          for t in pzb img4 gtar trustcache jq; do
+            [[ -x "tools/darwin/$t" ]] || { echo "MISS: tool $t" >&2; exit 1; }
+            echo "OK: tool: $t"
+          done
+
+      - name: Patch build.sh for case-insensitive board handling
+        run: |
+          set -e
+          cp build.sh build.sh.bak
+          python3 << 'PY'
+          import sys
+          with open('build.sh', 'r') as f:
+              content = f.read()
+          orig = 'if item.get("Info", {}).get("DeviceClass") == board'
+          repl = 'if item.get("Info", {}).get("DeviceClass", "").lower() == board.lower()'
+          if orig not in content:
+              if repl in content:
+                  sys.exit(0)
+              raise SystemExit("Unexpected DeviceClass selector; refusing unverified build")
+          content = content.replace(orig, repl)
+          # Panel lookup in scripts/devices.sh expects lowercase board names.
+          logo_orig = '"$ROOT/scripts/make_logo.sh" "$MODEL"'
+          logo_repl = '"$ROOT/scripts/make_logo.sh" "${MODEL,,}"'
+          if logo_orig not in content and logo_repl not in content:
+              raise SystemExit("Unexpected logo invocation")
+          content = content.replace(logo_orig, logo_repl)
+          with open('build.sh', 'w') as f:
+              f.write(content)
+          print("Patched build.sh: case-insensitive DeviceClass matching")
+          PY
+          diff -u build.sh.bak build.sh || true
+
+      - name: Patch env.sh so a CI venv actually gets used
+        # env.sh rebuilds PATH as:
+        #   /usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS:<inherited PATH>
+        # /usr/bin comes first, so every bare `python3` call inside build.sh (including
+        # the pyimg4-based wrap_kernel() heredoc) resolves to the system CLT/Homebrew
+        # python3, never to the venv from "Setup Python venv" above - no matter how that
+        # venv was activated before ./build.sh was invoked. That's exactly why the build
+        # fails with "ModuleNotFoundError: No module named 'pyimg4'" right after the
+        # AOP/ANE/AVE/ISP/GFX/SIO firmware is staged: it's the first bare `python3 <<EOF`
+        # call in build.sh that actually needs a third-party package instead of stdlib.
+        # Prepend $VIRTUAL_ENV/bin when a venv is active so build.sh picks it up; falls
+        # back to the original resolution order when no venv is active (unchanged
+        # behaviour for manual, non-CI runs).
+        run: |
+          set -e
+          cp env.sh env.sh.bak
+          python3 << 'PY'
+          with open('env.sh', 'r') as f:
+              content = f.read()
+          orig = 'export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS${PATH:+:$PATH}"'
+          repl = 'export PATH="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin:}/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS${PATH:+:$PATH}"'
+          if orig not in content:
+              if repl not in content:
+                  raise SystemExit("Unexpected env.sh PATH; refusing unverified Python setup")
+          else:
+              content = content.replace(orig, repl)
+              with open('env.sh', 'w') as f:
+                  f.write(content)
+              print("Patched env.sh: python3 now prefers an active venv over system python3")
+          PY
+          diff -u env.sh.bak env.sh || true
+
+      - name: Replace irecovery with CI shim
+        run: |
+          set -e
+          # CI identity only: this does not represent a connected/pwned device.
+          # --device bypasses detection; the shim rejects all non-query commands.
+          # build.sh uses $NR_TOOLS/irecovery (absolute path), not PATH.
+          # We must replace the actual binary temporarily.
+          mv tools/darwin/irecovery tools/darwin/irecovery.stock
+          cat > tools/darwin/irecovery << 'SHIM'
+          #!/bin/bash
+          if [[ "$1" == "-q" ]]; then
+            cat << 'INNER'
+          PRODUCT: iPad11,4
+          MODEL: J218AP
+          CPID: 0x8020
+          MODE: DFU
+          PWND: usbliter8
+          ECID: 0000000000000000
+          NAME: iPad Air 3 Cellular
+          INNER
+          else
+            echo "irecovery shim: unsupported args: $@" >&2
+            exit 1
+          fi
+          SHIM
+          chmod +x tools/darwin/irecovery
+          echo "=== Shim test (via absolute path) ==="
+          tools/darwin/irecovery -q
+
+      - name: Validate iPadOS BuildManifest
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_BUILD" == "21E237" ]]
+          source .venv/bin/activate
+          MANIFEST_DIR="$RUNNER_TEMP/ipad-air3-manifest"
+          mkdir -p "$MANIFEST_DIR"
+          ipsw download ipsw --device iPad11,4 --build "$TARGET_BUILD" --build-manifest --output "$MANIFEST_DIR"
+          python3 - "$MANIFEST_DIR" << 'PY'
+          from pathlib import Path
+          import plistlib
+          import sys
+          files = list(Path(sys.argv[1]).rglob("BuildManifest.plist"))
+          if len(files) != 1:
+              raise SystemExit(f"Expected one BuildManifest, found {len(files)}")
+          manifest = plistlib.loads(files[0].read_bytes())
+          assert manifest["ProductBuildVersion"] == "21E237", "Wrong firmware build"
+          assert manifest["ProductVersion"] == "17.4.1", "Wrong firmware version"
+          assert "iPad11,4" in manifest["SupportedProductTypes"], "Wrong product"
+          identities = [i for i in manifest["BuildIdentities"]
+                        if i.get("Info", {}).get("DeviceClass", "").lower() == "j218ap"]
+          assert identities, "No J218AP identity"
+          for identity in identities:
+              cpid = identity["ApChipID"]
+              assert (int(cpid, 0) if isinstance(cpid, str) else cpid) == 0x8020, "Wrong chip"
+              required = ("iBEC", "DeviceTree", "KernelCache", "RestoreRamDisk", "RestoreTrustCache")
+              for key in required:
+                  assert identity["Manifest"].get(key, {}).get("Info", {}).get("Path"), key
+              print("Validated:", identity["Info"])
+          PY
+
+      - name: Build bootchain
+        run: |
+          set -e
+          # Now that env.sh (patched above) prepends $VIRTUAL_ENV/bin ahead of system
+          # python3, activating the venv here actually determines which python3
+          # build.sh's internal `python3 <<EOF` calls (e.g. wrap_kernel's pyimg4 use)
+          # will resolve to.
+          source .venv/bin/activate
+          export PATH="$(pwd)/.venv/bin:$PATH"
+
+          [[ "$TARGET_BUILD" == "21E237" ]]
+          case "$KERNEL_MODE" in stock|patched) ;; *) exit 64 ;; esac
+          ARGS=(--device iPad11,4 --build "$TARGET_BUILD" --kernel "$KERNEL_MODE")
+          if [[ "$WITH_FW" == "true" ]]; then
+            ARGS+=(--with-fw)
+          else
+            ARGS+=(--no-fw)
+          fi
+          echo "Target: iPad11,4 / J218AP / 0x8020 / $TARGET_BUILD"
+          # build.sh uses Bash 4+ syntax; macOS /bin/bash is 3.2.
+          "$(brew --prefix)/bin/bash" ./build.sh "${ARGS[@]}"
+
+      - name: Inspect bootchain
+        run: |
+          set -e
+          echo "=== Bootchain files ==="
+          find bootchain -type f -print
+          echo "=== Bootchain sizes ==="
+          du -ah bootchain
+          echo "=== chain.info ==="
+          cat bootchain/*/chain.info || true
+
+      - name: Package artifact
+        run: |
+          set -e
+          BOOTCHAIN_DIR="bootchain/J218AP-17.4.1-$TARGET_BUILD-ramdisk"
+          python3 - "$BOOTCHAIN_DIR/chain.info" "$KERNEL_MODE" "$WITH_FW" << 'PY'
+          from pathlib import Path
+          import sys
+          info = dict(line.split("=", 1) for line in Path(sys.argv[1]).read_text().splitlines())
+          expected = dict(product="iPad11,4", model="J218AP", cpid="0x8020", chip="A12",
+                          version="17.4.1", build="21E237", kernel=sys.argv[2],
+                          with_fw="1" if sys.argv[3] == "true" else "0")
+          for key, value in expected.items():
+              assert info.get(key) == value, (key, info.get(key), value)
+          PY
+          if [[ -z "$BOOTCHAIN_DIR" ]]; then
+            echo "ERROR: No bootchain directory found" >&2
+            exit 1
+          fi
+          BUILD_NAME=$(basename "$BOOTCHAIN_DIR")
+          echo "BOOTCHAIN_NAME=$BUILD_NAME" >> "$GITHUB_ENV"
+          
+          mkdir -p artifact/bootchain
+          cp -R "$BOOTCHAIN_DIR"/. artifact/bootchain/
+          
+          cat > artifact/BUILD-INFO.txt << EOF
+          Device: iPad Air 3 Cellular
+          ProductType: iPad11,4
+          BoardConfig: J218AP
+          CPID: 0x8020
+          Chip: A12 / T8020
+          iPadOS: 17.4.1
+          Build: $TARGET_BUILD
+          Kernel: $KERNEL_MODE
+          With-FW: $WITH_FW
+          Runner: macos-15
+          Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Repository: ${{ github.repository }}
+          Commit: ${{ github.sha }}
+          EOF
+          
+          echo "${{ github.sha }}" > artifact/source-commit.txt
+          
+          tar -czf ipad-air3-cellular-a12-ramdisk.tar.gz -C artifact .
+          
+          echo "=== Final artifact ==="
+          find artifact -type f
+          du -ah artifact ipad-air3-cellular-a12-ramdisk.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipad-air3-cellular-a12-ramdisk-${{ inputs.ios_version }}
+          path: |
+            artifact/
+            ipad-air3-cellular-a12-ramdisk.tar.gz
+          if-no-files-found: error
+
+      - name: Restore original files
+        if: always()
+        run: |
+          # Restore original irecovery
+          if [[ -f tools/darwin/irecovery.stock ]]; then
+            mv -f tools/darwin/irecovery.stock tools/darwin/irecovery
+            echo "Restored original irecovery"
+          fi
+          # Restore original build.sh
+          if [[ -f build.sh.bak ]]; then
+            mv -f build.sh.bak build.sh
+            echo "Restored original build.sh"
+          fi
+          # Restore original env.sh
+          if [[ -f env.sh.bak ]]; then
+            mv -f env.sh.bak env.sh
+            echo "Restored original env.sh"
+          fi
