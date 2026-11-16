@@ -394,6 +394,57 @@ class IBootPatchfinder:
                         near, new_args, "Strategy 5: ADR → %%s near rd=md0 ADR"
                     )
 
+        # Strategy 6: iPad Air 3 / 21E237: the shared "%s" string is
+        # far from rd=md0 in the string table. Match the formatting CALLS,
+        # not their strings' physical proximity. Require one unambiguous ADR
+        # into x2 and the same formatting callee used for rd=md0.
+        if rd_md0 is not None:
+            def formatting_callee(site):
+                if site + 20 > self.size:
+                    return None
+                if rd32(self.data, site) & 0x1F != 2:
+                    return None
+                if rd32(self.data, site + 4) != NOP_U32:
+                    return None
+                # SUB X0, X29, #imm; MOV W1, #imm; BL formatter.
+                if rd32(self.data, site + 8) & 0xFFC003FF != 0xD10003A0:
+                    return None
+                if rd32(self.data, site + 12) & 0xFFE0001F != 0x52800001:
+                    return None
+                call = rd32(self.data, site + 16)
+                if call >> 26 != 0b100101:
+                    return None
+                delta = call & 0x3FFFFFF
+                if delta & (1 << 25):
+                    delta -= 1 << 26
+                return site + 16 + delta * 4
+
+            anchors = [(r, formatting_callee(r)) for r in self.find_adr_refs(rd_md0)]
+            anchors = [(r, callee) for r, callee in anchors if callee is not None]
+            candidates = set()
+            pos = 0
+            while anchors:
+                idx = self.data.find(b'%s\x00', pos)
+                if idx < 0:
+                    break
+                pos = idx + 1
+                if idx and self.data[idx - 1] != 0:
+                    continue  # Exclude suffixes of other format strings.
+                for site in self.find_adr_refs(idx):
+                    callee = formatting_callee(site)
+                    if callee is not None and any(
+                        abs(site - r) < 0x200 and callee == target
+                        for r, target in anchors
+                    ):
+                        candidates.add(site)
+            if len(candidates) == 1:
+                return self._inject_boot_args_adr(
+                    sorted(candidates), new_args,
+                    "Strategy 6: relocated format, matched rd=md0 formatting call"
+                )
+            if candidates:
+                self.log("  [-] Ambiguous relocated boot-args format; refusing patch")
+
         self.log("  [-] Boot-args pattern not found")
         return False
 
