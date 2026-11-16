@@ -113,6 +113,12 @@ jobs:
           if logo_orig not in content and logo_repl not in content:
               raise SystemExit("Unexpected logo invocation")
           content = content.replace(logo_orig, logo_repl)
+          # The target iBEC is encrypted: extraction alone preserves ciphertext.
+          extract_orig = 'ipsw img4 im4p extract -o "$WORK/iBEC.raw" "$WORK/iBEC.im4p"'
+          extract_repl = 'ipsw img4 im4p extract --lookup --lookup-device "$PRODUCT" --lookup-build "$BUILD" -o "$WORK/iBEC.raw" "$WORK/iBEC.im4p"'
+          if content.count(extract_orig) != 1:
+              raise SystemExit("Unexpected iBEC extraction command")
+          content = content.replace(extract_orig, extract_repl)
           with open('build.sh', 'w') as f:
               f.write(content)
           print("Patched build.sh: case-insensitive DeviceClass matching")
