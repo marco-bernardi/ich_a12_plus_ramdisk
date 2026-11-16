@@ -187,7 +187,7 @@ jobs:
           source .venv/bin/activate
           MANIFEST_DIR="$RUNNER_TEMP/ipad-air3-manifest"
           mkdir -p "$MANIFEST_DIR"
-          ipsw download ipsw --device iPad11,4 --build "$TARGET_BUILD" --build-manifest --output "$MANIFEST_DIR"
+          ipsw download ipsw --device iPad11,4 --build "$TARGET_BUILD" --confirm --pattern '(^|/)BuildManifest[.]plist$' --output "$MANIFEST_DIR"
           python3 - "$MANIFEST_DIR" << 'PY'
           from pathlib import Path
           import plistlib
